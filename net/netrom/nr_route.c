@@ -7,6 +7,7 @@
  * Copyright Jonathan Naylor G4KLX (g4klx@g4klx.demon.co.uk)
  * Copyright Alan Cox GW4PTS (alan@lxorguk.ukuu.org.uk)
  * Copyright Tomi Manninen OH2BNS (oh2bns@sral.fi)
+ * Copyright Jeroen Vreeken PE1RXQ (pe1rxq@amsat.org)
  */
 #include <linux/errno.h>
 #include <linux/types.h>
@@ -39,12 +40,18 @@
 
 static unsigned int nr_neigh_no = 1;
 
-static HLIST_HEAD(nr_node_list);
-static DEFINE_SPINLOCK(nr_node_list_lock);
-static HLIST_HEAD(nr_neigh_list);
-static DEFINE_SPINLOCK(nr_neigh_list_lock);
+/*
+	Unfortunatly at some times both the nr_neigh_list and nr_node_list have
+	to be locked at the same time.
+	In this case the following rule applies:
+	First lock the nr_neigh_list, second the nr_node_list.
+ */
+HLIST_HEAD(nr_node_list);
+spinlock_t nr_node_list_lock = SPIN_LOCK_UNLOCKED;
+HLIST_HEAD(nr_neigh_list);
+spinlock_t nr_neigh_list_lock = SPIN_LOCK_UNLOCKED;
 
-static struct nr_node *nr_node_get(ax25_address *callsign)
+struct nr_node *nr_node_get(ax25_address *callsign)
 {
 	struct nr_node *found = NULL;
 	struct nr_node *nr_node;
@@ -61,7 +68,7 @@ static struct nr_node *nr_node_get(ax25_address *callsign)
 	return found;
 }
 
-static struct nr_neigh *nr_neigh_get_dev(ax25_address *callsign,
+struct nr_neigh *nr_neigh_get_dev(ax25_address *callsign,
 					 struct net_device *dev)
 {
 	struct nr_neigh *found = NULL;
@@ -86,13 +93,12 @@ static void nr_remove_neigh(struct nr_neigh *);
  *	Add a new route to a node, and in the process add the node and the
  *	neighbour if it is new.
  */
-static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
+int nr_add_node(ax25_address *nr, const char *mnemonic,
 	ax25_address *ax25, ax25_digi *ax25_digi, struct net_device *dev,
 	int quality, int obs_count)
 {
 	struct nr_node  *nr_node;
 	struct nr_neigh *nr_neigh;
-	struct nr_route nr_route;
 	int i, found;
 	struct net_device *odev;
 
@@ -125,6 +131,10 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 			nr_node_unlock(nr_nodet);
 		}
 		spin_unlock_bh(&nr_node_list_lock);
+#ifdef CONFIG_NETROM_INP
+		/* Send an l3rtt frame */
+		inp3_l3rtt_tx(nr_neigh);
+#endif
 	}
 
 	if (nr_neigh != NULL)
@@ -152,6 +162,10 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 		nr_neigh->count    = 0;
 		nr_neigh->number   = nr_neigh_no++;
 		nr_neigh->failed   = 0;
+#ifdef CONFIG_NETROM_INP
+		nr_neigh->inp_state= NR_INP_STATE_0;
+		nr_neigh->rtt	   = 0;
+#endif
 		atomic_set(&nr_neigh->refcount, 1);
 
 		if (ax25_digi != NULL && ax25_digi->ndigi > 0) {
@@ -170,6 +184,10 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 		hlist_add_head(&nr_neigh->neigh_node, &nr_neigh_list);
 		nr_neigh_hold(nr_neigh);
 		spin_unlock_bh(&nr_neigh_list_lock);
+#ifdef CONFIG_NETROM_INP
+		/* Send an l3rtt frame to the new neighbour */
+		inp3_l3rtt_tx(nr_neigh);
+#endif
 	}
 
 	if (quality != 0 && ax25cmp(nr, ax25) == 0 && !nr_neigh->locked)
@@ -211,7 +229,16 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 
 	for (found = 0, i = 0; i < nr_node->count; i++) {
 		if (nr_node->routes[i].neighbour == nr_neigh) {
+#ifdef CONFIG_NETROM_INP
+			/* Only set quality for non-inp3 nodes */
+			if (!nr_node->routes[i].tt &&
+			    !(!ax25cmp(nr, ax25) && nr_neigh->inp_state==NR_INP_STATE_INP))
+				nr_node->routes[i].quality = quality;
+			else
+				quality = nr_node->routes[i].quality;
+#else
 			nr_node->routes[i].quality   = quality;
+#endif
 			nr_node->routes[i].obs_count = obs_count;
 			found = 1;
 			break;
@@ -251,10 +278,57 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 		}
 	}
 
-	/* Now re-sort the routes in quality order */
+	nr_neigh_put(nr_neigh);
+
+	nr_sort_node(nr_node);
+
+	nr_node_unlock(nr_node);
+	nr_node_put(nr_node);
+	return 0;
+}
+
+/*
+	Calculate route time (less is better)
+	Also take hop count in account.
+ */
+static inline int route2time(struct nr_node *nr_node, struct nr_route *route)
+{
+	int time;
+
+	if (!route->tt &&
+	    !(!ax25cmp(&nr_node->callsign, &route->neighbour->callsign) &&
+	    route->neighbour->inp_state==NR_INP_STATE_INP) ) {
+		/* Netrom routes get a hopscount of 255 to give a slight
+		   preference to inp3 routes */
+		time=(qual2rtt(route->quality)<<8) +255;
+	} else {
+		time=(route->tt+route->neighbour->rtt)<<8;
+		time|=route->hops;
+	}
+	return time;
+}
+
+/*
+	This function was split of of nr_add_node because the inp3 code
+	needed only the sorting functionality.
+	Traditionally sorting was done in quality order.
+	A problem arose when the precission of the l3rtt measurements
+	became better then that of its quality. Because of this all
+	sorting is now done based on time and hopcount.
+	
+	Jeroen
+	
+	This code expects the node to be locked.
+ */
+void nr_sort_node(struct nr_node *nr_node)
+{
+	struct nr_route nr_route;
+	int i;
+
 	switch (nr_node->count) {
 	case 3:
-		if (nr_node->routes[1].quality > nr_node->routes[0].quality) {
+		if (route2time(nr_node, &nr_node->routes[1]) <
+		    route2time(nr_node, &nr_node->routes[0])) {
 			switch (nr_node->which) {
 				case 0:  nr_node->which = 1; break;
 				case 1:  nr_node->which = 0; break;
@@ -264,31 +338,24 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 			nr_node->routes[0] = nr_node->routes[1];
 			nr_node->routes[1] = nr_route;
 		}
-		if (nr_node->routes[2].quality > nr_node->routes[1].quality) {
+		if (route2time(nr_node, &nr_node->routes[2]) <
+		    route2time(nr_node, &nr_node->routes[1])) {
 			switch (nr_node->which) {
-			case 1:  nr_node->which = 2;
-				break;
-
-			case 2:  nr_node->which = 1;
-				break;
-
-			default:
-				break;
+				case 1:  nr_node->which = 2; break;
+				case 2:  nr_node->which = 1; break;
+				default: break;
 			}
 			nr_route           = nr_node->routes[1];
 			nr_node->routes[1] = nr_node->routes[2];
 			nr_node->routes[2] = nr_route;
 		}
 	case 2:
-		if (nr_node->routes[1].quality > nr_node->routes[0].quality) {
+		if (route2time(nr_node, &nr_node->routes[1]) <
+		    route2time(nr_node, &nr_node->routes[0])) {
 			switch (nr_node->which) {
-			case 0:  nr_node->which = 1;
-				break;
-
-			case 1:  nr_node->which = 0;
-				break;
-
-			default: break;
+				case 0:  nr_node->which = 1; break;
+				case 1:  nr_node->which = 0; break;
+				default: break;
 			}
 			nr_route           = nr_node->routes[0];
 			nr_node->routes[0] = nr_node->routes[1];
@@ -299,17 +366,13 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 	}
 
 	for (i = 0; i < nr_node->count; i++) {
-		if (nr_node->routes[i].neighbour == nr_neigh) {
+		if (nr_node->routes[i].neighbour->failed == 0) {
 			if (i < nr_node->which)
 				nr_node->which = i;
 			break;
 		}
 	}
-
-	nr_neigh_put(nr_neigh);
-	nr_node_unlock(nr_node);
-	nr_node_put(nr_node);
-	return 0;
+	return;
 }
 
 static inline void __nr_remove_node(struct nr_node *nr_node)
@@ -348,23 +411,9 @@ static void nr_remove_neigh(struct nr_neigh *nr_neigh)
  *	"Delete" a node. Strictly speaking remove a route to a node. The node
  *	is only deleted if no routes are left to it.
  */
-static int nr_del_node(ax25_address *callsign, ax25_address *neighbour, struct net_device *dev)
+int nr_del_node_found(struct nr_node *nr_node, struct nr_neigh *nr_neigh)
 {
-	struct nr_node  *nr_node;
-	struct nr_neigh *nr_neigh;
 	int i;
-
-	nr_node = nr_node_get(callsign);
-
-	if (nr_node == NULL)
-		return -EINVAL;
-
-	nr_neigh = nr_neigh_get_dev(neighbour, dev);
-
-	if (nr_neigh == NULL) {
-		nr_node_put(nr_node);
-		return -EINVAL;
-	}
 
 	nr_node_lock(nr_node);
 	for (i = 0; i < nr_node->count; i++) {
@@ -403,6 +452,26 @@ static int nr_del_node(ax25_address *callsign, ax25_address *neighbour, struct n
 	return -EINVAL;
 }
 
+static int nr_del_node(ax25_address *callsign, ax25_address *neighbour, struct net_device *dev)
+{
+	struct nr_node  *nr_node;
+	struct nr_neigh *nr_neigh;
+
+	nr_node = nr_node_get(callsign);
+
+	if (nr_node == NULL)
+		return -EINVAL;
+
+	nr_neigh = nr_neigh_get_dev(neighbour, dev);
+
+	if (nr_neigh == NULL) {
+		nr_node_put(nr_node);
+		return -EINVAL;
+	}
+
+	return nr_del_node_found(nr_node, nr_neigh);
+}
+
 /*
  *	Lock a neighbour with a quality.
  */
@@ -431,6 +500,10 @@ static int __must_check nr_add_neigh(ax25_address *callsign,
 	nr_neigh->count    = 0;
 	nr_neigh->number   = nr_neigh_no++;
 	nr_neigh->failed   = 0;
+#ifdef CONFIG_NETROM_INP
+	nr_neigh->inp_state= NR_INP_STATE_0;
+	nr_neigh->rtt	   = 0;
+#endif
 	atomic_set(&nr_neigh->refcount, 1);
 
 	if (ax25_digi != NULL && ax25_digi->ndigi > 0) {
@@ -472,6 +545,92 @@ static int nr_del_neigh(ax25_address *callsign, struct net_device *dev, unsigned
 	return 0;
 }
 
+#ifdef CONFIG_NETROM_INP
+/*
+ *	Decrement the obsolescence count by one. If a route is reduced to a
+ *	count of zero, remove it. Also remove any unlocked neighbours with
+ *	zero nodes routing via it.
+ */
+static int nr_dec_obs(void)
+{
+	struct nr_neigh *nr_neigh;
+	struct nr_node  *s;
+	struct hlist_node *node, *nodet;
+	struct nr_node **neg_node;
+	int neg_nodes=0;
+	int i;
+
+	neg_node=kmalloc(sizeof(struct nr_node *)*MAX_RIPNEG, GFP_ATOMIC);
+	if (!neg_node) {
+		return 0;
+	}
+	spin_lock_bh(&nr_neigh_list_lock);
+	spin_lock_bh(&nr_node_list_lock);
+	nr_node_for_each_safe(s, node, nodet, &nr_node_list) {
+		nr_node_lock(s);
+		for (i = 0; i < s->count; i++) {
+			switch (s->routes[i].obs_count) {
+			case 0:		/* A locked entry */
+				break;
+
+			case 1:		/* From 1 -> 0 */
+				nr_neigh = s->routes[i].neighbour;
+				nr_neigh_hold(nr_neigh);
+
+				/* This is negative INP info */
+				if (i==0) {
+					/* send negative info about the node */
+					s->routes[i].tt=TT_HORIZON;
+					s->routes[i].hops=254;
+					nr_node_unlock(s);
+					if (neg_nodes>=MAX_RIPNEG) {
+						inp3_nodes_neg(neg_node, neg_nodes, NULL, &nr_neigh_list);
+						neg_nodes=0;
+					}
+					nr_node_hold(s);
+					neg_node[neg_nodes]=s;
+					neg_nodes++;
+					continue;
+				}
+
+				nr_neigh->count--;
+				nr_neigh_put(nr_neigh);
+
+				if (nr_neigh->count == 0 && !nr_neigh->locked)
+					nr_remove_neigh(nr_neigh);
+
+				s->count--;
+
+				switch (i) {
+					case 0:
+						s->routes[0] = s->routes[1];
+					case 1:
+						s->routes[1] = s->routes[2];
+					case 2:
+						break;
+				}
+				break;
+
+			default:
+				/* we don't use the obs count for INP
+				   neighbours */
+				if (s->routes[i].neighbour->inp_state==NR_INP_STATE_INP)
+					continue;
+				s->routes[i].obs_count--;
+				break;
+			}
+		}
+		nr_node_unlock(s);
+	}
+	spin_unlock_bh(&nr_node_list_lock);
+	if (neg_nodes)
+		inp3_nodes_neg(neg_node, neg_nodes, NULL, &nr_neigh_list);
+	kfree(neg_node);
+	spin_unlock_bh(&nr_neigh_list_lock);
+
+	return 0;
+}
+#else
 /*
  *	Decrement the obsolescence count by one. If a route is reduced to a
  *	count of zero, remove it. Also remove any unlocked neighbours with
@@ -516,10 +675,8 @@ static int nr_dec_obs(void)
 			default:
 				s->routes[i].obs_count--;
 				break;
-
 			}
 		}
-
 		if (s->count <= 0)
 			nr_remove_node_locked(s);
 		nr_node_unlock(s);
@@ -528,6 +685,7 @@ static int nr_dec_obs(void)
 
 	return 0;
 }
+#endif
 
 /*
  *	A device has been removed. Remove its routes and neighbours.
@@ -730,6 +888,7 @@ void nr_link_failed(ax25_cb *ax25, int reason)
 	struct nr_neigh *s, *nr_neigh = NULL;
 	struct hlist_node *node;
 	struct nr_node  *nr_node = NULL;
+	int i;
 
 	spin_lock_bh(&nr_neigh_list_lock);
 	nr_neigh_for_each(s, node, &nr_neigh_list) {
@@ -744,6 +903,31 @@ void nr_link_failed(ax25_cb *ax25, int reason)
 	if (nr_neigh == NULL)
 		return;
 
+#ifdef CONFIG_NETROM_INP
+	/* Set quality to zero for all its routes
+	   by setting the obs_count to 1 we ensure that the node is
+	   removed soon */
+	spin_lock_bh(&nr_node_list_lock);
+	nr_node_for_each(nr_node, node, &nr_node_list) {
+		nr_node_lock(nr_node);
+		for (i=0; i<nr_node->count; i++) {
+			if (nr_node->routes[i].neighbour==nr_neigh) {
+				nr_node->routes[i].tt=0;
+				nr_node->routes[i].quality=0;
+				nr_node->routes[i].obs_count=1;
+				nr_sort_node(nr_node);
+			}
+		}
+		nr_node_unlock(nr_node);
+	}
+	spin_unlock_bh(&nr_node_list_lock);
+	/* Tell the other neighbours the link has failed */
+	nr_neigh->rtt=TT_HORIZON;
+	inp3_route_neg(nr_neigh);
+	nr_neigh->inp_state=NR_INP_STATE_0;
+	nr_neigh->rtt=0;
+#endif
+
 	nr_neigh->ax25 = NULL;
 	ax25_cb_put(ax25);
 
@@ -751,6 +935,7 @@ void nr_link_failed(ax25_cb *ax25, int reason)
 		nr_neigh_put(nr_neigh);
 		return;
 	}
+#ifndef CONFIG_NETROM_INP
 	spin_lock_bh(&nr_node_list_lock);
 	nr_node_for_each(nr_node, node, &nr_node_list) {
 		nr_node_lock(nr_node);
@@ -760,6 +945,7 @@ void nr_link_failed(ax25_cb *ax25, int reason)
 		nr_node_unlock(nr_node);
 	}
 	spin_unlock_bh(&nr_node_list_lock);
+#endif
 	nr_neigh_put(nr_neigh);
 }
 
@@ -778,6 +964,13 @@ int nr_route_frame(struct sk_buff *skb, ax25_cb *ax25)
 	int ret;
 	struct sk_buff *skbn;
 
+#ifdef CONFIG_NETROM_INP
+	/* Is it an INP3 Routing Information Frame? */
+	if (skb->data[0]==0xff) {
+		inp3_rif_rx(skb, ax25);
+		return 0;
+	}
+#endif
 
 	nr_src  = (ax25_address *)(skb->data + 0);
 	nr_dest = (ax25_address *)(skb->data + 7);
@@ -801,6 +994,12 @@ int nr_route_frame(struct sk_buff *skb, ax25_cb *ax25)
 
 	if (!sysctl_netrom_routing_control && ax25 != NULL)
 		return 0;
+
+#ifdef CONFIG_NETROM_INP
+	/* Is it an INP3 return time measurment frame? */
+	if (!ax25cmp(nr_dest, &inp3_l3rtt_addr))
+		return inp3_l3rtt_rx(skb, ax25);
+#endif
 
 	/* Its Time-To-Live has expired */
 	if (skb->data[14] == 1) {

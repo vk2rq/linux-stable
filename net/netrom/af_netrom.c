@@ -7,6 +7,7 @@
  * Copyright Jonathan Naylor G4KLX (g4klx@g4klx.demon.co.uk)
  * Copyright Alan Cox GW4PTS (alan@lxorguk.ukuu.org.uk)
  * Copyright Darryl Miles G7LED (dlm@g7led.demon.co.uk)
+ * Copyright Jeroen Vreeken PE1RXQ (pe1rxq@amsat.org)
  */
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -1254,7 +1255,27 @@ static int nr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	case SIOCNRDECOBS:
 		if (!capable(CAP_NET_ADMIN)) return -EPERM;
 		return nr_rt_ioctl(cmd, argp);
-
+#ifdef CONFIG_NETROM_INP
+	case SIOCNRSETMNEM: {
+		struct nr_route_struct nr_route;
+		release_sock(sk);
+		if (copy_from_user(&nr_route, (void *)arg, sizeof(struct nr_route_struct)))
+			return -EFAULT;
+		return inp3_set_mnem(&nr_route.callsign, nr_route.mnemonic);
+	}
+	case SIOCNRGETMNEM: {
+		struct nr_route_struct nr_route;
+		int ret;
+		release_sock(sk);
+		if (copy_from_user(&nr_route, (void *)arg, sizeof(struct nr_route_struct)))
+			return -EFAULT;
+		ret = inp3_get_mnem(&nr_route.callsign, nr_route.mnemonic);
+		if (ret >= 0)
+			if (copy_to_user((void *)arg, &nr_route, sizeof(struct nr_route_struct)))
+				return -EFAULT;
+		return ret;
+	}
+#endif /* CONFIG_NETROM_INP */
 	default:
 		return -ENOIOCTLCMD;
 	}
@@ -1438,7 +1459,7 @@ static int __init nr_proto_init(void)
 		struct net_device *dev;
 
 		sprintf(name, "nr%d", i);
-		dev = alloc_netdev(0, name, nr_setup);
+		dev = alloc_netdev(sizeof(struct nr_dev_priv), name, nr_setup);
 		if (!dev) {
 			printk(KERN_ERR "NET/ROM: nr_proto_init - unable to allocate device structure\n");
 			goto fail;
@@ -1473,6 +1494,11 @@ static int __init nr_proto_init(void)
 	proc_net_fops_create(&init_net, "nr", S_IRUGO, &nr_info_fops);
 	proc_net_fops_create(&init_net, "nr_neigh", S_IRUGO, &nr_neigh_fops);
 	proc_net_fops_create(&init_net, "nr_nodes", S_IRUGO, &nr_nodes_fops);
+
+#ifdef CONFIG_NETROM_INP
+	kinp3d_start();
+#endif
+
 out:
 	return rc;
 fail:
@@ -1499,6 +1525,10 @@ MODULE_ALIAS_NETPROTO(PF_NETROM);
 static void __exit nr_exit(void)
 {
 	int i;
+
+#ifdef CONFIG_NETROM_INP
+	kinp3d_stop();
+#endif
 
 	proc_net_remove(&init_net, "nr");
 	proc_net_remove(&init_net, "nr_neigh");

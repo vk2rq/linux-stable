@@ -9,6 +9,7 @@
 
 #include <linux/netrom.h>
 #include <linux/list.h>
+#include <linux/types.h>
 #include <net/sock.h>
 
 #define	NR_NETWORK_LEN			15
@@ -37,6 +38,13 @@ enum {
 	NR_STATE_3
 };
 
+/* Define INP3 State constants */
+enum {
+	NR_INP_STATE_0,		/* Not recognized as an INP neighbour */
+	NR_INP_STATE_RTT,	/* Got RTT back, but no RIPs yet... */
+	NR_INP_STATE_INP,	/* Recognized as a full INP neighbour */
+};
+
 #define	NR_COND_ACK_PENDING		0x01
 #define	NR_COND_REJECT			0x02
 #define	NR_COND_PEER_RX_BUSY		0x04
@@ -58,6 +66,11 @@ enum {
 #define NR_MODULUS 			256
 #define NR_MAX_WINDOW_SIZE		127			/* Maximum Window Allowable - 127 */
 #define	NR_MAX_PACKET_SIZE		236			/* Maximum Packet Length - 236 */
+
+struct nr_dev_priv {
+	struct			net_device_stats;
+	char			mnemonic[7];
+};
 
 struct nr_sock {
 	struct sock		sock;
@@ -93,12 +106,16 @@ struct nr_neigh {
 	unsigned int		number;
 	unsigned char		failed;
 	atomic_t		refcount;
+	unsigned char		inp_state;	/* inp3 state */
+	unsigned int		rtt;		/* inp3 return-time */
 };
 
 struct nr_route {
 	unsigned char   quality;
 	unsigned char   obs_count;
 	struct nr_neigh *neighbour;
+	unsigned int	tt;			/* inp3 target-time */
+	unsigned int	hops;			/* inp3 hop counter */
 };
 
 struct nr_node {
@@ -110,11 +127,18 @@ struct nr_node {
 	struct nr_route		routes[3];
 	atomic_t		refcount;
 	spinlock_t		node_lock;
+	unsigned int		ltt;		/* inp3 last send target-time */
 };
 
 /*********************************************************************
  *	nr_node & nr_neigh lists, refcounting and locking
  *********************************************************************/
+
+extern spinlock_t nr_node_list_lock;
+extern spinlock_t nr_neigh_list_lock;
+
+extern struct hlist_head nr_node_list;
+extern struct hlist_head nr_neigh_list;
 
 #define nr_node_hold(__nr_node) \
 	atomic_inc(&((__nr_node)->refcount))
@@ -207,6 +231,12 @@ extern void nr_enquiry_response(struct sock *);
 extern void nr_check_iframes_acked(struct sock *, unsigned short);
 
 /* nr_route.c */
+extern struct nr_node *nr_node_get(ax25_address *);
+extern struct nr_neigh *nr_neigh_get_dev(ax25_address *, struct net_device *);
+extern int nr_add_node(ax25_address *, const char *, ax25_address *,
+    ax25_digi *, struct net_device *, int, int);
+extern void nr_sort_node(struct nr_node *);
+extern int nr_del_node_found(struct nr_node *, struct nr_neigh *);
 extern void nr_rt_device_down(struct net_device *);
 extern struct net_device *nr_dev_first(void);
 extern struct net_device *nr_dev_get(ax25_address *);
@@ -265,5 +295,23 @@ extern int  nr_t1timer_running(struct sock *);
 /* sysctl_net_netrom.c */
 extern void nr_register_sysctl(void);
 extern void nr_unregister_sysctl(void);
+
+/* inp3.c */
+extern ax25_address inp3_l3rtt_addr;
+extern int inp3_set_mnem(ax25_address *, const char *);
+extern int inp3_get_mnem(ax25_address *, char *);
+extern void inp3_nodes_neg(struct nr_node **, int, struct nr_neigh *, 
+    struct hlist_head *);
+extern void inp3_route_neg(struct nr_neigh *);
+extern int inp3_rif_rx(struct sk_buff *, ax25_cb *);
+extern int inp3_l3rtt_rx(struct sk_buff *, ax25_cb *);
+extern int inp3_l3rtt_tx(struct nr_neigh *);
+extern void kinp3d_start(void);
+extern void kinp3d_stop(void);
+
+#define TT_HORIZON	60000
+#define MAX_RIPNEG	15
+#define ttlimit(tt)	((tt) > TT_HORIZON ? TT_HORIZON : (tt))
+#define qual2rtt(qual)	((qual) ? (ttlimit((256-(qual))*20)) : TT_HORIZON)
 
 #endif

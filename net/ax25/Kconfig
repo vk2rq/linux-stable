@@ -94,6 +94,17 @@ config NETROM
 	  To compile this driver as a module, choose M here: the
 	  module will be called netrom.
 
+config NETROM_INP
+	bool "NET/ROM INP3 support"
+	depends on NETROM
+	help
+	  INP3 is an extension to the NET/ROM protocol.
+	  It uses time measurements instead of quality to set up routing.
+	  If you say Y here your Linux box will be able to communicate with
+	  other nodes that use this protocol.
+	  If you say N you will get 'old style' NET/ROM behaviour.
+	  If unsure, say N.
+
 config ROSE
 	tristate "Amateur Radio X.25 PLP (Rose)"
 	depends on AX25

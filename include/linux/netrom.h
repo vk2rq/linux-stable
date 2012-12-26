@@ -16,6 +16,9 @@
 #define	NETROM_IDLE	7
 
 #define	SIOCNRDECOBS		(SIOCPROTOPRIVATE+2)
+/* 3 and 4 have been used in the past, so we don't use them for a while... */
+#define SIOCNRSETMNEM		(SIOCPROTOPRIVATE+5)
+#define SIOCNRGETMNEM		(SIOCPROTOPRIVATE+6)
 
 struct nr_route_struct {
 #define	NETROM_NEIGH	0
